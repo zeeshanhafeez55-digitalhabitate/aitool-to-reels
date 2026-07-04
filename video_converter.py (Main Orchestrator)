@@ -1,0 +1,266 @@
+"""
+Main video converter - orchestrates the full pipeline.
+"""
+
+import os
+import json
+import time
+from typing import List, Dict, Optional
+from config import Config
+from scene_detector import SceneDetector
+from highlight_extractor import HighlightExtractor
+from video_editor import VideoEditor
+from subtitle_generator import SubtitleGenerator
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class VideoToShortsConverter:
+    """
+    Main converter class that orchestrates the full video-to-shorts pipeline.
+
+    Usage:
+        converter = VideoToShortsConverter("input_video.mp4")
+        results = converter.convert(
+            num_clips=5,
+            format_preset="youtube_shorts",
+            add_subtitles=True,
+        )
+    """
+
+    def __init__(self, video_path: str):
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video not found: {video_path}")
+
+        self.video_path = video_path
+        self.highlight_extractor = HighlightExtractor(video_path)
+        self.video_editor = VideoEditor(video_path)
+        self.scene_detector = SceneDetector(video_path)
+
+        Config.ensure_dirs()
+        logger.info(f"Initialized converter for: {video_path}")
+
+    def convert(
+        self,
+        num_clips: int = 5,
+        clip_duration: float = 30.0,
+        format_preset: str = "youtube_shorts",
+        add_subtitles: bool = True,
+        subtitle_style: str = "modern",
+        add_effects: bool = True,
+        output_dir: str = None,
+        method: str = "highlights",
+    ) -> List[Dict]:
+        """
+        Convert a long video into short clips.
+
+        Args:
+            num_clips: Number of clips to generate
+            clip_duration: Target duration per clip (seconds)
+            format_preset: Format preset name
+            add_subtitles: Whether to add subtitles
+            subtitle_style: 'modern', 'karaoke', 'minimal'
+            add_effects: Whether to add visual effects
+            output_dir: Output directory (default: Config.OUTPUT_DIR)
+            method: 'highlights' (AI-based), 'scenes' (scene-based),
+                    'uniform' (evenly spaced), 'manual' (manual timestamps)
+
+        Returns:
+            List of result dicts with clip info
+        """
+        output_dir = output_dir or Config.OUTPUT_DIR
+        os.makedirs(output_dir, exist_ok=True)
+
+        start_time = time.time()
+        logger.info("=" * 60)
+        logger.info("🎬 VIDEO TO SHORTS CONVERSION STARTED")
+        logger.info(f"   Method: {method}")
+        logger.info(f"   Format: {format_preset}")
+        logger.info(f"   Clips: {num_clips} × {clip_duration}s")
+        logger.info("=" * 60)
+
+        # Step 1: Determine segments
+        if method == "highlights":
+            segments = self._get_highlight_segments(
+                num_clips, clip_duration, format_preset
+            )
+        elif method == "scenes":
+            segments = self._get_scene_segments(num_clips, clip_duration)
+        elif method == "uniform":
+            segments = self._get_uniform_segments(num_clips, clip_duration)
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+        # Step 2: Create clips
+        results = []
+        for i, segment in enumerate(segments):
+            logger.info(
+                f"\n📹 Processing clip {i + 1}/{len(segments)}: "
+                f"{segment['start']:.1f}s - {segment['end']:.1f}s"
+            )
+
+            output_path = os.path.join(
+                output_dir,
+                f"clip_{i + 1:03d}_{format_preset}.mp4"
+            )
+
+            try:
+                clip_path = self.video_editor.create_short_clip(
+                    start=segment["start"],
+                    end=segment["end"],
+                    format_preset=format_preset,
+                    add_subtitles=add_subtitles,
+                    subtitle_style=subtitle_style,
+                    add_effects=add_effects,
+                    output_path=output_path,
+                )
+
+                result = {
+                    "clip_index": i + 1,
+                    "output_path": clip_path,
+                    "start_time": segment["start"],
+                    "end_time": segment["end"],
+                    "duration": segment["end"] - segment["start"],
+                    "format": format_preset,
+                    "score": segment.get("score", 0),
+                    "status": "success",
+                }
+                results.append(result)
+                logger.info(f"   ✅ Clip {i + 1} created successfully")
+
+            except Exception as e:
+                logger.error(f"   ❌ Failed to create clip {i + 1}: {e}")
+                results.append({
+                    "clip_index": i + 1,
+                    "status": "failed",
+                    "error": str(e),
+                    "start_time": segment["start"],
+                    "end_time": segment["end"],
+                })
+
+        # Step 3: Save metadata
+        elapsed = time.time() - start_time
+        metadata = {
+            "source_video": self.video_path,
+            "format_preset": format_preset,
+            "method": method,
+            "total_clips": len(results),
+            "successful_clips": sum(
+                1 for r in results if r["status"] == "success"
+            ),
+            "processing_time_seconds": round(elapsed, 2),
+            "clips": results,
+        }
+
+        metadata_path = os.path.join(output_dir, "conversion_metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info("\n" + "=" * 60)
+        logger.info("🎉 CONVERSION COMPLETE")
+        logger.info(
+            f"   Created {metadata['successful_clips']}/{len(segments)} clips"
+        )
+        logger.info(f"   Time: {elapsed:.1f}s")
+        logger.info(f"   Output: {output_dir}")
+        logger.info("=" * 60)
+
+        return results
+
+    def convert_with_timestamps(
+        self,
+        timestamps: List[Tuple[float, float]],
+        format_preset: str = "youtube_shorts",
+        **kwargs
+    ) -> List[Dict]:
+        """
+        Convert specific timestamps to short clips.
+
+        Args:
+            timestamps: List of (start, end) tuples in seconds
+            format_preset: Format preset name
+        """
+        segments = [
+            {"start": s, "end": e, "score": 1.0}
+            for s, e in timestamps
+        ]
+
+        results = []
+        for i, segment in enumerate(segments):
+            output_path = os.path.join(
+                Config.OUTPUT_DIR,
+                f"manual_clip_{i + 1:03d}.mp4"
+            )
+            try:
+                clip_path = self.video_editor.create_short_clip(
+                    start=segment["start"],
+                    end=segment["end"],
+                    format_preset=format_preset,
+                    output_path=output_path,
+                    **kwargs
+                )
+                results.append({
+                    "clip_index": i + 1,
+                    "output_path": clip_path,
+                    "status": "success"
+                })
+            except Exception as e:
+                results.append({
+                    "clip_index": i + 1,
+                    "status": "failed",
+                    "error": str(e)
+                })
+
+        return results
+
+    def _get_highlight_segments(
+        self, num_clips: int, clip_duration: float, format_preset: str
+    ) -> List[Dict]:
+        """Get segments based on highlight scoring."""
+        return self.highlight_extractor.extract_highlights(
+            num_clips=num_clips,
+            clip_duration=clip_duration,
+            format_preset=format_preset,
+        )
+
+    def _get_scene_segments(
+        self, num_clips: int, clip_duration: float
+    ) -> List[Dict]:
+        """Get segments based on scene detection."""
+        scenes = self.scene_detector.detect_scenes()
+
+        # Score scenes by duration closeness to target
+        scored_scenes = []
+        for start, end in scenes:
+            duration = end - start
+            score = 1.0 - abs(duration - clip_duration) / clip_duration
+            scored_scenes.append({
+                "start": start,
+                "end": min(start + clip_duration, end),
+                "score": max(0, score),
+            })
+
+        scored_scenes.sort(key=lambda x: x["score"], reverse=True)
+        return scored_scenes[:num_clips]
+
+    def _get_uniform_segments(
+        self, num_clips: int, clip_duration: float
+    ) -> List[Dict]:
+        """Get evenly distributed segments."""
+        duration = self.highlight_extractor.video_duration
+        spacing = duration / (num_clips + 1)
+
+        segments = []
+        for i in range(1, num_clips + 1):
+            center = spacing * i
+            start = max(0, center - clip_duration / 2)
+            end = min(duration, start + clip_duration)
+            segments.append({
+                "start": start,
+                "end": end,
+                "score": 0.5,
+            })
+
+        return segments
